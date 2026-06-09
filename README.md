@@ -129,7 +129,182 @@ SUBSYSTEM=="power_supply", KERNEL=="BAT1", ATTR{status}=="Charging", RUN+="/bin/
 
 ---
 
-## 5. Audio — Firmware CS35L57
+## 5. Performances stockage et mémoire
+
+### 5.1 Scheduler NVMe — mq-deadline
+
+Créer `/etc/udev/rules.d/60-nvme-scheduler.rules` :
+```
+ACTION=="add|change", KERNEL=="nvme[0-9]*", ATTR{queue/scheduler}="mq-deadline"
+```
+```bash
+sudo udevadm trigger --action=change --subsystem-match=block
+cat /sys/block/nvme0n1/queue/scheduler  # doit afficher [mq-deadline]
+```
+
+### 5.2 noatime sur les montages BTRFS
+
+Dans `/etc/fstab`, remplacer `relatime` par `noatime` sur les subvolumes `@` et `@home`. Garder `relatime` sur les montages swap, logs et pkg.
+
+```bash
+sudo systemctl daemon-reload
+sudo mount -o remount /
+sudo mount -o remount /home
+```
+
+### 5.3 fstrim périodique
+
+```bash
+sudo systemctl enable --now fstrim.timer
+```
+
+### 5.4 zram — swap compressé en RAM
+
+Créer `/etc/systemd/zram-generator.conf` :
+```ini
+[zram0]
+compression-algorithm = zstd
+zram-size = ram / 2
+```
+```bash
+sudo systemctl restart systemd-zram-setup@zram0
+zramctl  # doit afficher ~15.4GB
+```
+
+---
+
+## 6. GPU Arc B390 — Optimisations avancées
+
+### 6.1 SAGV (System Agent Voltage Gating)
+
+Ajouter dans `/etc/kernel/cmdline` :
+```
+xe.enable_sagv=1
+```
+Puis rebuilder : `sudo mkinitcpio -P`
+
+Active le voltage gating du System Agent Intel — économie d'énergie sur la mémoire. **Expérimental** (taint kernel).
+
+### 6.2 VA-API — Décodage vidéo hardware
+
+```bash
+sudo pacman -S libva-utils
+vainfo  # doit lister H264/HEVC/AV1 VAEntrypointVLD
+```
+
+L'Arc B390 supporte le décodage hardware de tous les codecs modernes via VA-API.
+
+### 6.3 DVMT Pre-Allocated — FBC complet
+
+**Problème :** Le driver `xe` affiche au boot :
+```
+xe: Reducing the compressed framebuffer size. This may lead to less power savings
+```
+FBC (Framebuffer Compression) réduit → plus de bande passante mémoire → moins d'autonomie.
+
+**Cause :** Samsung bloque l'option DVMT Pre-Allocated dans le BIOS (menu caché). Valeur par défaut : 64MB. Insuffisant pour FBC complet sur dalle haute résolution.
+
+**Solution : modifier la variable NVRAM `SaSetup` directement depuis Linux.**
+
+#### Analyse du BIOS (déjà effectuée — résultats)
+
+```bash
+# Dump du flash SPI
+sudo flashrom -p internal -r /tmp/bios.bin
+
+# Extraction des modules UEFI
+uefiextract /tmp/bios.bin
+```
+
+Résultats de l'analyse IFR :
+- Variable : **SaSetup**
+- GUID : `72C5E28C-7783-43A1-8767-FAD73FCCAFA4`
+- Offset dans SaSetup : **0x05**
+- Opcode IFR : NUMERIC, min=0, max=7, step=1
+- Valeur actuelle : `0x02` = 64MB
+- Valeur cible : `0x04` = 128MB (ou `0x07` = max)
+- Offset absolu dans le flash 32MB : `0x104c577`
+- Secteur SPI concerné : `0x104c000–0x104d000` (4KB)
+
+#### Modification depuis Linux (MTD)
+
+Le flash SPI est accessible en écriture via `/dev/mtd0` (`flags=0xc00` = MTD_WRITEABLE).
+
+```bash
+# 1. Localiser et extraire la variable dans le dump existant
+python3 -c "
+import sys; sys.path.insert(0, '/usr/lib/python3.14/site-packages')
+from chipsec.library.uefi.varstore import getNVstore_NVAR, getEFIvariables_NVAR
+data = open('/tmp/bios.bin','rb').read()
+off, sz, _ = getNVstore_NVAR(data)
+nvram = data[off:off+sz]
+sa = getEFIvariables_NVAR(nvram)['SaSetup'][0]
+print(f'SaSetup offset 0x05 = 0x{sa[3][5]:02x}')
+"
+
+# 2. Créer le secteur patché
+python3 -c "
+BIOS_DUMP = '/tmp/bios.bin'
+SECTOR_START = 0x104c000
+SECTOR_SIZE = 4096
+sector = bytearray(open(BIOS_DUMP,'rb').read()[SECTOR_START:SECTOR_START+SECTOR_SIZE])
+sector[0x577] = 0x04  # 128MB
+open('/tmp/dvmt_sector_patched.bin','wb').write(bytes(sector))
+print('Sector patched: offset 0x577 = 0x04')
+"
+
+# 3. Écrire le secteur (SUDO REQUIS)
+sudo python3 /tmp/write_dvmt.py
+```
+
+Script `/tmp/write_dvmt.py` :
+```python
+import os, struct, fcntl, sys
+
+MEMERASE  = 0x40084d02
+MEMUNLOCK = 0x40084d04
+SECTOR_OFFSET  = 0x104c000
+SECTOR_SIZE    = 4096
+DVMT_IN_SECTOR = 0x577
+PATCHED_FILE   = '/tmp/dvmt_sector_patched.bin'
+
+patched = open(PATCHED_FILE, 'rb').read()
+fd = os.open('/dev/mtd0', os.O_RDWR | os.O_SYNC)
+os.lseek(fd, SECTOR_OFFSET, os.SEEK_SET)
+current = os.read(fd, SECTOR_SIZE)
+print(f"Current DVMT: 0x{current[DVMT_IN_SECTOR]:02x}")
+erase_struct = struct.pack('II', SECTOR_OFFSET, SECTOR_SIZE)
+try:
+    fcntl.ioctl(fd, MEMUNLOCK, erase_struct)
+except: pass
+fcntl.ioctl(fd, MEMERASE, erase_struct)
+os.lseek(fd, SECTOR_OFFSET, os.SEEK_SET)
+os.write(fd, patched)
+os.lseek(fd, SECTOR_OFFSET, os.SEEK_SET)
+verify = os.read(fd, SECTOR_SIZE)
+val = verify[DVMT_IN_SECTOR]
+print(f"After write: 0x{val:02x} ({'SUCCESS' if val == 0x04 else 'FAIL — use RU.efi instead'})")
+os.close(fd)
+```
+
+#### Vérification après reboot
+
+```bash
+sudo dmesg | grep -i "stolen\|fbc\|framebuffer\|compressed"
+# Le message "Reducing the compressed framebuffer size" ne doit plus apparaître
+```
+
+#### Alternative : RU.efi (si MTD write échoue)
+
+1. Télécharger `RU.efi` et créer une clé USB bootable (`EFI/BOOT/BOOTx64.EFI`)
+2. Boot → F12 → clé USB EFI
+3. `Alt+=` → trouver GUID `72C5E28C-7783-43A1-8767-FAD73FCCAFA4` (SaSetup)
+4. Offset `0x05` : changer `02` → `04`
+5. `Ctrl+S` → reboot
+
+---
+
+## 8. Audio — Firmware CS35L57
 
 Le Book6 Pro utilise 4 amplis Cirrus Logic CS35L57 (2 woofers + 2 tweeters) via SoundWire. Le firmware de tuning Samsung n'est pas inclus dans `linux-firmware` et doit être extrait depuis Windows.
 
@@ -186,7 +361,7 @@ sudo dmesg | grep -i "cs35l\|calibr\|tuning"
 
 ---
 
-## 6. BTRFS — Swap isolé
+## 9. BTRFS — Swap isolé
 
 Le swapfile doit être dans un subvolume séparé `@swap` pour que snapper ne tente pas de le snapshoter (ce qui causerait des erreurs).
 
@@ -219,7 +394,7 @@ sudo swapon /swap/swapfile
 
 ---
 
-## 7. Firmware — Vérification et mises à jour
+## 10. Firmware — Vérification et mises à jour
 
 ```bash
 sudo fwupdmgr refresh
@@ -231,7 +406,7 @@ Le BIOS se met à jour via capsule UEFI (fwupd). Pas besoin de Windows pour les 
 
 ---
 
-## 8. Points d'attention futurs
+## 11. Points d'attention futurs
 
 ### Kernel 7.1
 - FRED sera actif par défaut (retirer `fred=on` du cmdline)
@@ -246,19 +421,27 @@ Le BIOS se met à jour via capsule UEFI (fwupd). Pas besoin de Windows pour les 
 ### linux-firmware
 - Surveiller l'ajout de firmware officiel Samsung CS35L57 dans linux-firmware upstream — à terme les fichiers extraits de Windows ne seront plus nécessaires.
 
+### DVMT / FBC
+- Vérifier après reboot que `dmesg | grep -i compressed` ne montre plus le warning FBC.
+- Si le BIOS Samsung resette `SaSetup` lors d'une mise à jour BIOS, refaire la modification (`SaSetup[0x05] = 0x04`).
+- Tester PSR re-activation (`xe.enable_psr=0` → retirer) après stabilisation xe — avec DVMT 128MB le FBC devrait tenir.
+
 ---
 
-## 9. Récapitulatif des fichiers modifiés
+## 12. Récapitulatif des fichiers modifiés
 
 | Fichier | Contenu |
 |---|---|
-| `/etc/kernel/cmdline` | Paramètres kernel (PSR, FRED) |
+| `/etc/kernel/cmdline` | Paramètres kernel (PSR, FRED, SAGV) |
 | `/etc/NetworkManager/conf.d/wifi-powersave-off.conf` | Wi-Fi power save désactivé |
+| `/etc/udev/rules.d/60-nvme-scheduler.rules` | Scheduler NVMe mq-deadline |
 | `/etc/udev/rules.d/99-pci-powersave.rules` | PCI runtime PM auto |
 | `/etc/udev/rules.d/99-battery-threshold.rules` | Charge threshold 80% |
 | `/etc/udev/rules.d/99-platform-profile.rules` | Profile auto sur batterie |
 | `/etc/tmpfiles.d/epb.conf` | Energy Performance Bias |
 | `/etc/sysctl.d/99-memory.conf` | Paramètres mémoire |
+| `/etc/systemd/zram-generator.conf` | zram 15.4GB zstd |
 | `/etc/scx_loader.toml` | Scheduler scx_lavd |
-| `/etc/fstab` | Subvolume @swap |
+| `/etc/fstab` | noatime + subvolume @swap |
 | `/lib/firmware/cirrus/cs35l57-b2-*` | Firmware audio CS35L57 |
+| NVRAM `SaSetup[0x05]` (flash SPI) | DVMT Pre-Allocated 64MB → 128MB |
