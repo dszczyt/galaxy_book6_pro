@@ -270,13 +270,59 @@ sudo dmesg | grep -i "stolen\|fbc\|framebuffer\|compressed"
 # Le message "Reducing the compressed framebuffer size" ne doit plus apparaître
 ```
 
-#### Alternative : RU.efi (si MTD write échoue)
+#### Statut — Toutes les tentatives échouées (protection firmware Samsung)
 
-1. Télécharger `RU.efi` et créer une clé USB bootable (`EFI/BOOT/BOOTx64.EFI`)
-2. Boot → F12 → clé USB EFI
-3. `Alt+=` → trouver GUID `72C5E28C-7783-43A1-8767-FAD73FCCAFA4` (SaSetup)
-4. Offset `0x05` : changer `02` → `04`
-5. `Ctrl+S` → reboot
+**Résumé : la modification est bloquée par deux protections indépendantes du firmware Insyde.**
+
+##### Tentative 1 — Écriture directe MTD depuis Linux (`write_dvmt.py --write`)
+
+```
+ioctl(MEMERASE) → errno 5 (EIO)
+```
+
+Le driver Linux `intel_spi` refuse l'effacement. La protection SPI (PR registers + FLOCKDN) est active :
+- Le BIOS configure les registres Protected Range (PRx) pour couvrir la région BIOS
+- Il pose `FLOCKDN=1` (Flash Configuration Lock-Down) pour verrouiller les PRx
+- Le driver MTD voit la protection hardware → refuse toute écriture
+
+##### Tentative 2 — RU.efi (outil BIOS UEFI)
+
+RU.efi est **incompatible avec Panther Lake** : se ferme immédiatement au lancement, quelle que soit la méthode (systemd-boot, entrée EFI directe, clé USB). Non débogable.
+
+##### Tentative 3 — `setup_var.efi` 0.3.1 via UEFI Shell (edk2-shell)
+
+Setup :
+- `Shell.efi` (edk2-shell) + `setup_var.efi` copiés dans `/boot/EFI/SHELL/`
+- `startup.nsh` au racine EFI : `setup_var.efi --reboot=auto --write_on_demand SaSetup:0x05=0x04`
+- Entrée EFI `Boot0004 UEFI Shell DVMT` en premier dans BootOrder
+
+Résultat au boot :
+
+```
+[1] SaSetup:0x5=0x02           ← lecture OK, variable trouvée
+[2] Error while setting content of variable SaSetup: WRITE_PROTECTED
+[3] SaSetup:0x5=0x02           ← inchangé
+```
+
+**Cause** : le BIOS Insyde appelle `VariableLock()` sur `SaSetup` pendant la phase DXE, avant l'événement ReadyToBoot. Le shell UEFI se lance après ReadyToBoot — `SetVariable` retourne `WRITE_PROTECTED` de façon permanente.
+
+La variable est en `BOOTSERVICE_ACCESS` uniquement (invisible depuis l'OS via `/sys/firmware/efi/efivars`), mais le verrouillage s'applique dès la fin de la phase DXE, indépendamment de la visibilité runtime.
+
+##### Pistes restantes
+
+| Outil | Mécanisme | Disponibilité |
+|---|---|---|
+| **Insyde H2OUVE** (`H2OUVEFI.efi`) | Éditeur Insyde natif — peut contourner `VariableLock` via protocoles Insyde internes | Propriétaire, parfois extrait de packages BIOS OEM |
+| **Intel FPT** (`FPTW64.efi`) | Écrit via Intel ME (canal séparé, bypasse les PR registers SPI) | Propriétaire, CSME System Tools Intel |
+| **Programmateur SPI externe** | Accès direct hardware (CH341A + pince SOIC-8) | Matériel requis |
+
+##### État actuel
+
+DVMT reste à 64MB (`SaSetup[0x05]=0x02`). Le warning xe persiste :
+```
+xe: Reducing the compressed framebuffer size. This may lead to less power savings
+```
+FBC (Framebuffer Compression) fonctionne en mode dégradé. Le GPU est pleinement fonctionnel. L'impact est une légère augmentation de la bande passante mémoire en mode desktop.
 
 ---
 
@@ -398,9 +444,9 @@ Le BIOS se met à jour via capsule UEFI (fwupd). Pas besoin de Windows pour les 
 - Surveiller l'ajout de firmware officiel Samsung CS35L57 dans linux-firmware upstream — à terme les fichiers extraits de Windows ne seront plus nécessaires.
 
 ### DVMT / FBC
-- Vérifier après reboot que `dmesg | grep -i compressed` ne montre plus le warning FBC.
-- Si le BIOS Samsung resette `SaSetup` lors d'une mise à jour BIOS, refaire la modification (`SaSetup[0x05] = 0x04`).
-- Tester PSR re-activation (`xe.enable_psr=0` → retirer) après stabilisation xe — avec DVMT 128MB le FBC devrait tenir.
+- DVMT bloqué à 64MB — toutes les tentatives de modification échouent (VariableLock BIOS + SPI hardware protection). Voir section 6.3.
+- Pistes : Insyde H2OUVE ou Intel FPT (tous deux propriétaires).
+- Si une future mise à jour BIOS Samsung expose l'option DVMT ou corrige le warning FBC, mettre à jour cette section.
 
 ---
 
@@ -420,4 +466,4 @@ Le BIOS se met à jour via capsule UEFI (fwupd). Pas besoin de Windows pour les 
 | `/etc/scx_loader.toml` | Scheduler scx_lavd |
 | `/etc/fstab` | noatime + subvolume @swap |
 | `/lib/firmware/cirrus/cs35l57-b2-*` | Firmware audio CS35L57 |
-| NVRAM `SaSetup[0x05]` (flash SPI) | DVMT Pre-Allocated 64MB → 128MB |
+| NVRAM `SaSetup[0x05]` (flash SPI) | DVMT Pre-Allocated — **bloqué** (VariableLock BIOS + SPI protection) |
