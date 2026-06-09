@@ -223,68 +223,44 @@ Résultats de l'analyse IFR :
 - Opcode IFR : NUMERIC, min=0, max=7, step=1
 - Valeur actuelle : `0x02` = 64MB
 - Valeur cible : `0x04` = 128MB (ou `0x07` = max)
-- Offset absolu dans le flash 32MB : `0x104c577`
-- Secteur SPI concerné : `0x104c000–0x104d000` (4KB)
+- Offset absolu dans le flash 32MB : `0x1056725` (entrée NVAR active, next=0xffffff)
+- Secteur SPI concerné : `0x1056000–0x1057000` (4KB)
+- Note : la chaîne NVAR comporte 4 entrées pour SaSetup. L'entrée 1 (`0x104c55f`) contient le nom ; les entrées 2–4 sont DATA-only. Seule l'entrée 4 (`0x1056716`, next=0xffffff) est lue par le BIOS.
 
 #### Modification depuis Linux (MTD)
 
 Le flash SPI est accessible en écriture via `/dev/mtd0` (`flags=0xc00` = MTD_WRITEABLE).
 
+Le script calcule **tous les offsets dynamiquement** depuis le flash live — aucune valeur hardcodée. Il suit la chaîne NVAR jusqu'à l'entrée active (`next=0xffffff`) et vérifie la structure avant d'écrire.
+
 ```bash
-# 1. Localiser et extraire la variable dans le dump existant
-python3 -c "
-import sys; sys.path.insert(0, '/usr/lib/python3.14/site-packages')
-from chipsec.library.uefi.varstore import getNVstore_NVAR, getEFIvariables_NVAR
-data = open('/tmp/bios.bin','rb').read()
-off, sz, _ = getNVstore_NVAR(data)
-nvram = data[off:off+sz]
-sa = getEFIvariables_NVAR(nvram)['SaSetup'][0]
-print(f'SaSetup offset 0x05 = 0x{sa[3][5]:02x}')
-"
+# Dry run (défaut) — vérifie tout, n'écrit rien
+sudo python3 write_dvmt.py
 
-# 2. Créer le secteur patché
-python3 -c "
-BIOS_DUMP = '/tmp/bios.bin'
-SECTOR_START = 0x104c000
-SECTOR_SIZE = 4096
-sector = bytearray(open(BIOS_DUMP,'rb').read()[SECTOR_START:SECTOR_START+SECTOR_SIZE])
-sector[0x577] = 0x04  # 128MB
-open('/tmp/dvmt_sector_patched.bin','wb').write(bytes(sector))
-print('Sector patched: offset 0x577 = 0x04')
-"
-
-# 3. Écrire le secteur (SUDO REQUIS)
-sudo python3 /tmp/write_dvmt.py
+# Écriture effective
+sudo python3 write_dvmt.py --write
 ```
 
-Script `/tmp/write_dvmt.py` :
-```python
-import os, struct, fcntl, sys
+Script [`write_dvmt.py`](./write_dvmt.py) (dans ce repo) :
 
-MEMERASE  = 0x40084d02
-MEMUNLOCK = 0x40084d04
-SECTOR_OFFSET  = 0x104c000
-SECTOR_SIZE    = 4096
-DVMT_IN_SECTOR = 0x577
-PATCHED_FILE   = '/tmp/dvmt_sector_patched.bin'
+```
+Logique du script :
+1. Lit /dev/mtd0 en entier
+2. Localise le NVAR store via CHIPSEC (getNVstore_NVAR)
+3. Scanne toutes les entrées NVAR, trouve celle nommée "SaSetup"
+4. Suit la chaîne next → next → ... jusqu'à next=0xffffff (entrée active)
+5. Vérifie : signature NVAR présente, data_len==890, valeur courante==0x02
+6. Calcule le secteur 4KB contenant le byte DVMT
+7. Dry run : affiche ce qui serait fait, sort sans écrire
+8. --write : efface le secteur, écrit le secteur patché, vérifie relecture
 
-patched = open(PATCHED_FILE, 'rb').read()
-fd = os.open('/dev/mtd0', os.O_RDWR | os.O_SYNC)
-os.lseek(fd, SECTOR_OFFSET, os.SEEK_SET)
-current = os.read(fd, SECTOR_SIZE)
-print(f"Current DVMT: 0x{current[DVMT_IN_SECTOR]:02x}")
-erase_struct = struct.pack('II', SECTOR_OFFSET, SECTOR_SIZE)
-try:
-    fcntl.ioctl(fd, MEMUNLOCK, erase_struct)
-except: pass
-fcntl.ioctl(fd, MEMERASE, erase_struct)
-os.lseek(fd, SECTOR_OFFSET, os.SEEK_SET)
-os.write(fd, patched)
-os.lseek(fd, SECTOR_OFFSET, os.SEEK_SET)
-verify = os.read(fd, SECTOR_SIZE)
-val = verify[DVMT_IN_SECTOR]
-print(f"After write: 0x{val:02x} ({'SUCCESS' if val == 0x04 else 'FAIL — use RU.efi instead'})")
-os.close(fd)
+Sécurités :
+- Abort si valeur inattendue (pas 0x02)
+- Abort si data_len != 890 (mauvaise variable)
+- Abort si entrée active introuvable
+- Vérifie que le flash live correspond au dump avant d'écrire
+- Exactement 1 byte changé dans le secteur (assertion)
+- FAIL détecté si SPI write protection active (→ utiliser RU.efi)
 ```
 
 #### Vérification après reboot
