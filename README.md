@@ -571,7 +571,51 @@ Le BIOS se met à jour via capsule UEFI (fwupd). Pas besoin de Windows pour les 
 
 ---
 
-## 11. Points d'attention futurs
+## 11. Lecteur d'empreintes — LighTuning ETU906Axx-E (1c7a:05d5)
+
+Non supporté par libfprint upstream. Fonctionne via le fork [likeablob/libfprint-fmv-etu906axx-e](https://github.com/likeablob/libfprint-fmv-etu906axx-e) avec le PID `05d5` ajouté manuellement.
+
+### Installation
+
+```bash
+git clone https://github.com/likeablob/libfprint-fmv-etu906axx-e ~/dev/github.com/likeablob/libfprint-fmv-etu906axx-e
+cd ~/dev/github.com/likeablob/libfprint-fmv-etu906axx-e
+```
+
+Ajouter `05d5` dans `libfprint/drivers/egismoc/egismoc.c` après la ligne `05b1` :
+```c
+{ .vid = 0x1c7a, .pid = 0x05d5, .driver_data = EGISMOC_DRIVER_CHECK_PREFIX_TYPE2 | EGISMOC_DRIVER_MAX_ENROLL_STAGES_20 },
+```
+
+```bash
+meson setup build --prefix=/usr -Ddrivers=egismoc
+ninja -C build
+sudo ninja -C build install
+sudo systemctl restart fprintd
+```
+
+### Enrollment et PAM
+
+```bash
+# Enregistrer une empreinte
+fprintd-enroll -f right-index-finger
+
+# Vérifier
+fprintd-verify
+
+# Activer pour sudo
+sudo sed -i '1s/^/auth sufficient pam_fprintd.so\n/' /etc/pam.d/sudo
+```
+
+### Notes
+
+- Le protocole `egismoc` TYPE2 + 20 stages fonctionne sur `05d5` (même que `05b1`)
+- `sudo` utilise l'empreinte sans mot de passe si le lecteur est disponible
+- Upstream libfprint ne supporte pas encore `05d5` — surveiller les futures releases
+
+---
+
+## 12. Points d'attention futurs
 
 ### Kernel 7.1
 - ✅ FRED actif par défaut — `fred=on` supprimé du cmdline
@@ -582,6 +626,9 @@ Le BIOS se met à jour via capsule UEFI (fwupd). Pas besoin de Windows pour les 
 - **PSR** (`xe.enable_psr=0`) — ✅ réactivé sur kernel 7.1rc7, stable
 - **PSR2 Selective Fetch** (`xe.enable_psr2_sel_fetch=0`) — ✅ réactivé sur kernel 7.1rc7, stable
 - **Panel Replay** (`xe.enable_panel_replay=0`) — ❌ encore buggé sur 7.1rc7 (crash display/screenshots). Retester sur 7.1 stable ou 7.2.
+
+### Lecteur d'empreintes (1c7a:05d5 LighTuning ETU906Axx-E)
+- ✅ **Fonctionnel** via fork libfprint de likeablob — voir section 12 pour l'installation.
 
 ### linux-firmware
 - Surveiller l'ajout de firmware officiel Samsung CS35L57 dans linux-firmware upstream — à terme les fichiers extraits de Windows ne seront plus nécessaires.
@@ -613,3 +660,5 @@ Le BIOS se met à jour via capsule UEFI (fwupd). Pas besoin de Windows pour les 
 | `/etc/fstab` | noatime + autodefrag (@, @home) + subvolume @swap |
 | `/lib/firmware/cirrus/cs35l57-b2-*` | Firmware audio CS35L57 |
 | NVRAM `SaSetup[0x05]` (flash SPI) | DVMT Pre-Allocated — **bloqué** (VariableLock BIOS + SPI protection) |
+| `/usr/lib/libfprint-2/libfprint-egismoc.so` | Driver empreinte patché (1c7a:05d5) |
+| `/etc/pam.d/sudo` | `pam_fprintd.so` pour auth sudo par empreinte |
