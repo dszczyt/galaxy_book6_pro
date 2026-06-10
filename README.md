@@ -308,13 +308,26 @@ Résultat au boot :
 
 La variable est en `BOOTSERVICE_ACCESS` uniquement (invisible depuis l'OS via `/sys/firmware/efi/efivars`), mais le verrouillage s'applique dès la fin de la phase DXE, indépendamment de la visibilité runtime.
 
-##### Pistes restantes
+##### Analyse du package BIOS (PAMB.1.5.74.371.CAP)
 
-| Outil | Mécanisme | Disponibilité |
+Le package BIOS récupéré depuis la partition Windows (`C:\Windows\System32\DriverStore\FileRepository\wfu_pamb.inf_amd64_718ead9e3c9f5385\`) révèle la cause racine.
+
+En-tête du fichier CAP :
+```
+_AMIPFAT + cAMI_BIOS_GUARD_FLASH_CONFIGURATION
+```
+
+**Intel BIOS Guard (PFAT) est actif.** Ce n'est pas une simple protection par registres PR — c'est une protection hardware au niveau silicon :
+
+| Couche | Mécanisme | Ce qu'il bloque |
 |---|---|---|
-| **Insyde H2OUVE** (`H2OUVEFI.efi`) | Éditeur Insyde natif — peut contourner `VariableLock` via protocoles Insyde internes | Propriétaire, parfois extrait de packages BIOS OEM |
-| **Intel FPT** (`FPTW64.efi`) | Écrit via Intel ME (canal séparé, bypasse les PR registers SPI) | Propriétaire, CSME System Tools Intel |
-| **Programmateur SPI externe** | Accès direct hardware (CH341A + pince SOIC-8) | Matériel requis |
+| Variable UEFI | `VariableLock` en phase DXE | `setup_var.efi` → WRITE_PROTECTED |
+| Flash SPI | Intel BIOS Guard / PFAT | `write_dvmt.py` → EIO, Intel FPT |
+| Intégrité boot | Intel Boot Guard (probable) | Programmateur SPI externe |
+
+Intel BIOS Guard signifie que le flash SPI ne peut être écrit que par des scripts PFAT signés avec la clé OEM Samsung. Aucun outil logiciel — y compris Intel FPT — ne peut contourner cette protection. H2OUVE n'est pas non plus présent dans le package BIOS.
+
+**Cette protection est intentionnelle et permanente.** La modification DVMT n'est réalisable que si Samsung expose l'option dans une mise à jour BIOS officielle.
 
 ##### État actuel
 
