@@ -10,19 +10,14 @@
 Éditer `/etc/kernel/cmdline`, puis rebuilder avec `sudo mkinitcpio -P`.
 
 ```
-xe.enable_psr=0 xe.enable_psr2_sel_fetch=0 xe.enable_panel_replay=0 fred=on
+xe.enable_panel_replay=0
 ```
 
 | Paramètre | Effet |
 |---|---|
-| `xe.enable_psr=0` | Désactive Panel Self Refresh — corrige les freezes display |
-| `xe.enable_psr2_sel_fetch=0` | Désactive Selective Fetch — corrige la corruption au retour du fullscreen |
-| `xe.enable_panel_replay=0` | Désactive Panel Replay — complète le fix display |
-| `fred=on` | Active FRED (Flexible Return and Event Delivery) — meilleure gestion des interruptions sur PTL |
+| `xe.enable_panel_replay=0` | Désactive Panel Replay — crashes screenshot/display sur kernel 7.1rc7 |
 
-> **Note :** PSR/PSR2/Panel Replay sont des features d'économie d'énergie qui causent des bugs sur le driver `xe` avec le Book6 Pro. Ils seront à réactiver progressivement sur les kernels futurs.
-
-> **Note :** FRED est désactivé par défaut sur kernel 7.0 mais activable manuellement. Il sera actif par défaut à partir de kernel 7.1.
+> **Kernel 7.1rc7 (juin 2026) :** PSR et PSR2 Selective Fetch réactivés avec succès — stables. `fred=on` supprimé (actif par défaut en 7.1). Seul Panel Replay reste désactivé (crash display confirmé).
 
 ---
 
@@ -114,18 +109,22 @@ vm.swappiness = 10
 vm.vfs_cache_pressure = 50
 vm.dirty_ratio = 10
 vm.dirty_background_ratio = 5
+vm.compaction_proactiveness = 0
 ```
 ```bash
 sudo sysctl -p /etc/sysctl.d/99-memory.conf
 ```
 
-### 4.6 Platform profile automatique
+`vm.compaction_proactiveness = 0` désactive la compaction mémoire proactive (coûteuse en CPU, inutile avec zram).
 
-Créer `/etc/udev/rules.d/99-platform-profile.rules` :
-```
-SUBSYSTEM=="power_supply", KERNEL=="BAT1", ATTR{status}=="Discharging", RUN+="/bin/sh -c 'echo low-power > /sys/firmware/acpi/platform_profile'"
-SUBSYSTEM=="power_supply", KERNEL=="BAT1", ATTR{status}=="Charging", RUN+="/bin/sh -c 'echo balanced > /sys/firmware/acpi/platform_profile'"
-```
+### 4.6 Platform profile — KDE Powerdevil + power-profiles-daemon
+
+Le platform profile est géré automatiquement par la chaîne :
+**KDE Powerdevil → power-profiles-daemon → samsung_galaxybook → `/sys/firmware/acpi/platform_profile`**
+
+Aucune configuration manuelle nécessaire. Powerdevil bascule automatiquement entre `balanced` (secteur) et `power-saver` (batterie) via `power-profiles-daemon`.
+
+Le module `samsung_galaxybook` expose aussi le rétroéclairage clavier (`leds/samsung-galaxybook::kbd_backlight`) géré par KDE.
 
 ---
 
@@ -170,6 +169,60 @@ zram-size = ram / 2
 sudo systemctl restart systemd-zram-setup@zram0
 zramctl  # doit afficher ~15.4GB
 ```
+
+### 5.5 BTRFS autodefrag
+
+Ajouter `autodefrag` dans `/etc/fstab` sur les montages `/` et `/home` :
+```
+rw,noatime,compress=zstd:3,ssd,space_cache=v2,autodefrag,subvol=/@
+```
+Utile pour les fichiers fréquemment modifiés par petits morceaux (bases SQLite de Firefox, journaux).
+
+```bash
+sudo mount -o remount,autodefrag /
+sudo mount -o remount,autodefrag /home
+sudo systemctl daemon-reload
+```
+
+### 5.6 Transparent Huge Pages — madvise
+
+THP=always alloue spéculativement des pages de 2MB même quand inutile. `madvise` ne le fait que sur demande explicite (JVM, malloc glibc).
+
+Créer `/etc/tmpfiles.d/thp.conf` :
+```
+w /sys/kernel/mm/transparent_hugepage/enabled - - - - madvise
+w /sys/kernel/mm/transparent_hugepage/defrag  - - - - defer+madvise
+```
+
+### 5.7 Réseau — TCP BBR + cake
+
+Meilleure gestion de la congestion réseau (streaming, visio).
+
+Créer `/etc/sysctl.d/99-network.conf` :
+```ini
+net.core.default_qdisc = cake
+net.ipv4.tcp_congestion_control = bbr
+```
+
+Charger les modules au boot via `/etc/modules-load.d/bbr.conf` :
+```
+tcp_bbr
+sch_cake
+```
+
+```bash
+sudo modprobe tcp_bbr sch_cake
+sudo sysctl -p /etc/sysctl.d/99-network.conf
+sysctl net.ipv4.tcp_congestion_control  # → bbr
+```
+
+### 5.8 NMI watchdog désactivé
+
+Le watchdog NMI n'a aucune utilité en usage desktop et consomme des cycles CPU/énergie.
+
+Ajouter dans `/etc/kernel/cmdline` : `nmi_watchdog=0 nowatchdog`
+
+Puis rebuilder : `sudo mkinitcpio -P`
 
 ---
 
@@ -339,6 +392,83 @@ FBC (Framebuffer Compression) fonctionne en mode dégradé. Le GPU est pleinemen
 
 ---
 
+## 7. C-states — intel_idle Panther Lake (kernel 7.1 requis)
+
+### Problème sur kernel 7.0
+
+`intel_idle` ne reconnaît pas Panther Lake (family 6, model 0xCC = 204) sur kernel 7.0. Fallback sur ACPI idle → seuls C1_ACPI/C2_ACPI/C3_ACPI disponibles → PC6/PC8/PC10 inaccessibles → **puissance idle ~7.55W** au lieu de ~4W attendus.
+
+Diagnostic :
+```bash
+sudo turbostat --quiet --show Pkg%pc10 --interval 5
+# Affiche : Counter 'PC2%' can not be added → PC10 inaccessible
+
+sudo dmesg | grep intel_idle
+# (vide — intel_idle ne se charge pas pour ce CPU)
+```
+
+### Cause racine
+
+Le tableau de support CPU dans `drivers/idle/intel_idle.c` ne contient pas l'entrée pour Panther Lake sur kernel 7.0. Sans correspondance, `intel_idle` passe la main à `acpi_idle` qui n'expose que les C-states ACPI basiques.
+
+### Solution — Kernel 7.1
+
+Commit **`intel_idle: Add Panther Lake C-states table`** mergé le 11 mars 2026 → présent dans kernel 7.1.
+
+Ce commit ajoute la table C-states complète pour Panther Lake : PC6, PC8, **PC10**. Gain attendu : **~4W idle** (contre 7.55W), résidency PC10 visible dans turbostat/powertop, meilleure autonomie sur batterie.
+
+### Installation
+
+**Option 1 — linux-mainline (AUR, recommandée maintenant)**
+
+`linux-mainline` 7.1rc7 contient déjà le commit. RC7 = très stable, quasi-identique au final.
+
+```bash
+yay -S linux-mainline linux-mainline-headers
+sudo reboot
+```
+
+Sélectionner l'entrée `linux-mainline` dans le menu systemd-boot. L'ancien kernel `linux` (7.0) reste disponible en fallback.
+
+**Option 2 — attendre linux 7.1 stable**
+
+```bash
+sudo pacman -Syu linux linux-headers
+```
+
+Dès que 7.1 arrive dans `core` (Arch repos).
+
+### Vérification post-upgrade
+
+```bash
+# C-states enregistrés par intel_idle
+cat /sys/devices/system/cpu/cpu0/cpuidle/state*/name
+# Attendu : POLL C1 C1E C6S C10
+
+# Driver actif
+cat /sys/devices/system/cpu/cpuidle/current_driver
+# Attendu : intel_idle
+
+# Puissance CPU package via RAPL (mesure sur 5s)
+e1=$(cat /sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj); sleep 5; e2=$(cat /sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj); echo "scale=2; ($e2-$e1)/5000000" | bc
+# Attendu : ~1.9W (vs ~7.5W sur kernel 7.0 sans C10)
+```
+
+> **Note :** `turbostat --show Pkg%pc10` retourne une erreur sur kernel 7.1rc7 (MSR Panther Lake non encore supporté par turbostat 2026.02.14). Les C-states sont néanmoins actifs — la mesure RAPL confirme ~1.9W CPU package au repos.
+
+### Résultats mesurés (kernel 7.1rc7, 10 juin 2026)
+
+| Métrique | Kernel 7.0 | Kernel 7.1rc7 | Kernel 7.1rc7 + PSR |
+|---|---|---|---|
+| Driver idle | acpi_idle | intel_idle | intel_idle |
+| C-states disponibles | C1/C2/C3_ACPI | C1/C1E/C6S/C10 | C1/C1E/C6S/C10 |
+| CPU package (RAPL) | n/a | 1.90W | **1.41W** |
+| Total système (batterie) | ~7.55W | — | **6.97W** |
+
+PSR (Panel Self Refresh) apporte −0.49W sur le package CPU en réduisant les accès mémoire du GPU pour le rafraîchissement display.
+
+---
+
 ## 8. Audio — Firmware CS35L57
 
 Le Book6 Pro utilise 4 amplis Cirrus Logic CS35L57 (2 woofers + 2 tweeters) via SoundWire. Le firmware de tuning Samsung n'est pas inclus dans `linux-firmware` et doit être extrait depuis Windows.
@@ -444,14 +574,14 @@ Le BIOS se met à jour via capsule UEFI (fwupd). Pas besoin de Windows pour les 
 ## 11. Points d'attention futurs
 
 ### Kernel 7.1
-- FRED sera actif par défaut (retirer `fred=on` du cmdline)
-- Meilleur support `pc10` (Package C10) sur Panther Lake → gain autonomie significatif
+- ✅ FRED actif par défaut — `fred=on` supprimé du cmdline
+- ✅ **intel_idle Panther Lake** — CPU package idle : 1.9W (vs 7.5W sur 7.0). Voir section 7.
+- ✅ PSR + PSR2 Selective Fetch réactivés (stables sur 7.1rc7)
 
 ### PSR/Panel Replay
-- Tester la réactivation progressive une fois les drivers `xe` stabilisés :
-  1. Retirer `xe.enable_psr2_sel_fetch=0` en premier
-  2. Puis `xe.enable_panel_replay=0`
-  3. Puis `xe.enable_psr=0` en dernier
+- **PSR** (`xe.enable_psr=0`) — ✅ réactivé sur kernel 7.1rc7, stable
+- **PSR2 Selective Fetch** (`xe.enable_psr2_sel_fetch=0`) — ✅ réactivé sur kernel 7.1rc7, stable
+- **Panel Replay** (`xe.enable_panel_replay=0`) — ❌ encore buggé sur 7.1rc7 (crash display/screenshots). Retester sur 7.1 stable ou 7.2.
 
 ### linux-firmware
 - Surveiller l'ajout de firmware officiel Samsung CS35L57 dans linux-firmware upstream — à terme les fichiers extraits de Windows ne seront plus nécessaires.
@@ -467,16 +597,19 @@ Le BIOS se met à jour via capsule UEFI (fwupd). Pas besoin de Windows pour les 
 
 | Fichier | Contenu |
 |---|---|
-| `/etc/kernel/cmdline` | Paramètres kernel (PSR, FRED, SAGV) |
+| `/etc/kernel/cmdline` | Paramètres kernel (Panel Replay off, SAGV, nmi_watchdog off) |
 | `/etc/NetworkManager/conf.d/wifi-powersave-off.conf` | Wi-Fi power save désactivé |
 | `/etc/udev/rules.d/60-nvme-scheduler.rules` | Scheduler NVMe mq-deadline |
 | `/etc/udev/rules.d/99-pci-powersave.rules` | PCI runtime PM auto |
 | `/etc/udev/rules.d/99-battery-threshold.rules` | Charge threshold 80% |
 | `/etc/udev/rules.d/99-platform-profile.rules` | Profile auto sur batterie |
 | `/etc/tmpfiles.d/epb.conf` | Energy Performance Bias |
-| `/etc/sysctl.d/99-memory.conf` | Paramètres mémoire |
+| `/etc/sysctl.d/99-memory.conf` | Paramètres mémoire + compaction_proactiveness=0 |
+| `/etc/sysctl.d/99-network.conf` | TCP BBR + cake qdisc |
+| `/etc/modules-load.d/bbr.conf` | Modules tcp_bbr + sch_cake au boot |
+| `/etc/tmpfiles.d/thp.conf` | THP = madvise |
 | `/etc/systemd/zram-generator.conf` | zram 15.4GB zstd |
 | `/etc/scx_loader.toml` | Scheduler scx_lavd |
-| `/etc/fstab` | noatime + subvolume @swap |
+| `/etc/fstab` | noatime + autodefrag (@, @home) + subvolume @swap |
 | `/lib/firmware/cirrus/cs35l57-b2-*` | Firmware audio CS35L57 |
 | NVRAM `SaSetup[0x05]` (flash SPI) | DVMT Pre-Allocated — **bloqué** (VariableLock BIOS + SPI protection) |
